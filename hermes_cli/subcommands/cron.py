@@ -97,6 +97,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--schedule", help="New schedule")
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")
+    cross_day = cron_edit.add_mutually_exclusive_group()
+    cross_day.add_argument("--skip-cross-day-catchup", dest="skip_cross_day_catchup",
+                           action="store_const", const=True, default=None,
+                           help="Skip automatic recurring occurrences from prior Tokyo dates.")
+    cross_day.add_argument("--allow-cross-day-catchup", dest="skip_cross_day_catchup",
+                           action="store_const", const=False,
+                           help="Restore normal cross-day catch-up behavior.")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--failure-deliver", dest="failure_deliver",
         help="Override target for failure notices (same grammar as --deliver; "

@@ -2086,6 +2086,8 @@ def _fill_missing_next_run(updated: dict[str, Any]) -> None:
 
 def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    if "skip_cross_day_catchup" in updates and not isinstance(updates["skip_cross_day_catchup"], bool):
+        raise ValueError("skip_cross_day_catchup must be a boolean")
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
@@ -2715,6 +2717,33 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _skip_cross_day(job: dict, instant: str | None, now: datetime) -> bool:
+    """Opt-in recurring jobs skip automatic occurrences from an earlier Tokyo date."""
+    if job.get("skip_cross_day_catchup") is not True or not instant:
+        return False
+    if job.get("schedule", {}).get("kind") not in {"cron", "interval"}:
+        return False
+    from zoneinfo import ZoneInfo
+    scheduled = _ensure_aware(datetime.fromisoformat(instant))
+    tokyo = ZoneInfo("Asia/Tokyo")
+    return scheduled.astimezone(tokyo).date() < _ensure_aware(now).astimezone(tokyo).date()
+
+
+def discard_cross_day_claim(job: dict) -> bool:
+    """Discard a queued occurrence if midnight passed since its original claim."""
+    if not _skip_cross_day(job, job.get("_scheduled_instant"), _hermes_now()):
+        return False
+    owner = (job.get("fire_claim") or {}).get("by")
+    def apply(jobs, _i, current):
+        claim = current.get("fire_claim") or {}
+        if owner and claim.get("by") == owner:
+            current["fire_claim"] = None
+            current.pop("pending_slot", None)
+            save_jobs(jobs)
+        return True
+    return _with_job(job["id"], apply, True)
+
+
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
@@ -2760,6 +2789,14 @@ def claim_job_for_fire(
         if (instant is not None
                 and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
             instant = None
+        if _skip_cross_day(job, instant, now):
+            nxt = compute_next_run(job["schedule"], now.isoformat())
+            if nxt:
+                job["next_run_at"] = nxt
+                job.pop("pending_slot", None)
+                save_jobs(jobs)
+            logger.info("Skipping cross-day cron occurrence %s for %s", instant, job_id)
+            return False
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -3252,6 +3289,13 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if _instant_after(d.next_run_dt, now):
+        return False
+
+    if not manual_run and _skip_cross_day(job, next_run, now):
+        new_next = d.recompute_next()
+        if new_next:
+            scan.persist(job["id"], next_run_at=new_next, pending_slot=None)
+        logger.info("Skipping cross-day cron occurrence %s for %s", next_run, job["id"])
         return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.

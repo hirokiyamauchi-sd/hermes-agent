@@ -2840,6 +2840,11 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    from cron.jobs import discard_cross_day_claim
+    if discard_cross_day_claim(job):
+        logger.info("Skipping queued cross-day occurrence for job %s", job["id"])
+        finish_execution(execution_id, success=False, error="Skipped cross-day catch-up")
+        return True
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:

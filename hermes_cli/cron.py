@@ -842,6 +842,7 @@ def cron_edit(args):
     result = _cron_api(action="update", job_id=args.job_id,
                        schedule=getattr(args, "schedule", None),
                        prompt=getattr(args, "prompt", None), skills=final_skills,
+                       skip_cross_day_catchup=getattr(args, "skip_cross_day_catchup", None),
                        no_agent=getattr(args, "no_agent", None), **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -852,6 +853,8 @@ def cron_edit(args):
     print(f"  Skills: {', '.join(updated['skills'])}" if updated.get("skills") else
           "  Skills: none")
     _print_job_details(updated)
+    if getattr(args, "skip_cross_day_catchup", None) is not None:
+        print(f"  Skip cross-day catch-up: {args.skip_cross_day_catchup}")
     return 0
 
 

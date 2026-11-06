@@ -3,8 +3,9 @@
 Recurring cron and interval jobs may opt in with the boolean job field
 `skip_cross_day_catchup: true`; absent or false preserves existing behavior.
 The jobs store API supports `update_job(job_id, {"skip_cross_day_catchup": True})`.
-No CLI/dashboard control is included in this candidate. To limit the policy to
-three jobs, explicitly update only those three records after separate approval.
+Use `hermes cron edit JOB_ID --skip-cross-day-catchup` to enable it and
+`hermes cron edit JOB_ID --allow-cross-day-catchup` to disable it. Apply only
+to the intended three job IDs after the Gateway runs the corresponding Core.
 This change itself does not update any jobs.
 
 An automatic occurrence whose scheduled date is before the dispatch date in

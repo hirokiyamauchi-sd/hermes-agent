@@ -24,6 +24,9 @@ def _add_catch_up(parser) -> None:
         help="Runs missed while the machine was off: 'on' runs once on return, 'off' skips "
              "them (each is booked as a 'missed' row in `hermes cron runs`). Default: "
              "cron.catch_up_missed for recurring jobs; one-shots skip.")
+    parser.add_argument(
+        "--skip-cross-day", type=_catch_up_flag, metavar="{on,off}",
+        help="Skip automatic fires after the scheduled local date; manual runs are unaffected (default off).")
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:

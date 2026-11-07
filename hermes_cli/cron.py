@@ -248,6 +248,7 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
          if job.get("no_agent") else ""),
         ("Timezone", job.get("timezone")),
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
+        ("Skip cross-day", "on" if job.get("skip_cross_day") is True else "off"),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
@@ -779,7 +780,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("interpreter", "interpreter"), ("timezone", "timezone"),
-                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"),
+                   ("skip_cross_day", "skip_cross_day"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:

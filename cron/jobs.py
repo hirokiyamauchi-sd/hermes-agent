@@ -1767,6 +1767,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "skip_cross_day": _normalize_catch_up,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1781,6 +1782,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "skip_cross_day": _normalize_catch_up,
 }
 
 
@@ -1835,6 +1837,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    skip_cross_day: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1939,6 +1942,7 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]),
+        ("skip_cross_day", f["skip_cross_day"]),
     ):
         if value is not None:
             job[key] = value
@@ -2230,13 +2234,23 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dic
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    if is_terminal_job(job):
+    if is_terminal_job(job) and not (job.get("state") == "completed" and job.get("cross_day_skipped_at")):
         name = job.get("name", job_id)
         raise ValueError(
             f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
             f"Create a new occurrence with 'hermes cron resume {name} "
             "--run-now' or '--at <ISO-8601>'.")
     manual_run_at = _hermes_now().isoformat()
+    if is_terminal_job(job):
+        def reactivate_skipped(jobs, _i, current):
+            if current.get("state") != "completed" or not current.get("cross_day_skipped_at"):
+                raise ValueError("Skipped one-shot is no longer available for a manual run")
+            _activate_job_record(current)
+            current.update(next_run_at=manual_run_at, manual_run_at=manual_run_at,
+                           manual_run_prompt=extra_prompt or None)
+            save_jobs(jobs)
+            return _normalize_job_record(current)
+        return _with_job(job["id"], reactivate_skipped)
     return update_job(job["id"], {
         "enabled": True,
         "state": "scheduled",
@@ -2722,7 +2736,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
-    manual: bool = False, return_job: bool = False,
+    manual: bool = False, return_job: bool = False, provider_fire: bool = False,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2734,11 +2748,12 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
-        if is_terminal_job(job) and not _is_recoverable_error_job(job):
+        skipped_manual = (force or manual) and job.get("state") == "completed" and job.get("cross_day_skipped_at")
+        if is_terminal_job(job) and not _is_recoverable_error_job(job) and not skipped_manual:
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
         # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
-        if not force and not is_job_runnable(job):
+        if not force and not skipped_manual and not is_job_runnable(job):
             return False
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
@@ -2749,7 +2764,19 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
+        # Provider callbacks carry no occurrence identity. For this opt-in policy they
+        # cannot safely distinguish a stale notification from the current slot.
+        # Leave the store untouched; builtin ticks and explicit manual runs still work.
+        if provider_fire and job.get("skip_cross_day") is True and not manual_fire:
+            logger.warning("Job '%s': automatic provider fire rejected: cross-day policy requires an occurrence identity; use the builtin ticker", job_id)
+            return False
         instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        if instant is None and not manual_fire and job.get("skip_cross_day") is True:
+            # Legacy naive timestamps have no occurrence-ledger identity, but the date fence
+            # still needs the actual stored slot; interpret them like the scheduler does.
+            parsed = _parse_aware(job.get("next_run_at"), jobs_time.zone_for_job(job))
+            if parsed is not None:
+                instant = scheduled_instant(parsed.isoformat())
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
         # in the future), so a claim arriving BEFORE the stored next occurrence
@@ -2764,6 +2791,8 @@ def claim_job_for_fire(
         # mark_job_run recomputes the same cron slot and the misfire backstop runs it twice.
         if (instant is not None
                 and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
+            if job.get("cross_day_skipped_at") and not manual_fire:
+                return False
             instant = None
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
@@ -2773,8 +2802,10 @@ def claim_job_for_fire(
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
             return False
-        if force:
+        if force or skipped_manual:
             _activate_job_record(job)
+        if not manual_fire or job.get("schedule", {}).get("kind") == "once":
+            job.pop("cross_day_skipped_at", None)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
@@ -3222,6 +3253,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))
+    if not manual_run and job.get("skip_cross_day") is True and job["_scheduled_instant"] is None:
+        job["_scheduled_instant"] = scheduled_instant(d.next_run_dt.isoformat())
 
     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
         return False

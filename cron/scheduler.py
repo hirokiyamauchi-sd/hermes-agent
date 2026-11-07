@@ -2811,6 +2811,10 @@ def run_one_job(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
         job["execution_id"] = execution["id"]
 
+    from cron.cross_day import should_skip, settle_skipped
+    if should_skip(job, _hermes_now()):
+        return settle_skipped(job)
+
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
